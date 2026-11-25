@@ -160,6 +160,44 @@ export function ScannerView({
     setEditorSlot(null);
   };
 
+  const optimizeImageForOcr = async (
+    dataUrl: string,
+    mimeType: string
+  ): Promise<{ dataUrl: string; mimeType: string }> => {
+    if (mimeType === 'application/pdf' || !dataUrl.startsWith('data:image/')) {
+      return { dataUrl, mimeType };
+    }
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const maxDim = 1600;
+        let { naturalWidth: w, naturalHeight: h } = img;
+        if (w <= maxDim && h <= maxDim && dataUrl.length < 900_000) {
+          resolve({ dataUrl, mimeType });
+          return;
+        }
+        const scale = Math.min(1, maxDim / Math.max(w, h));
+        w = Math.max(1, Math.round(w * scale));
+        h = Math.max(1, Math.round(h * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve({ dataUrl, mimeType });
+          return;
+        }
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve({
+          dataUrl: canvas.toDataURL('image/jpeg', 0.88),
+          mimeType: 'image/jpeg',
+        });
+      };
+      img.onerror = () => resolve({ dataUrl, mimeType });
+      img.src = dataUrl;
+    });
+  };
+
   const runExtractionForSlot = async (slot: 'driving_license' | 'vehicle_rc') => {
     const doc = slot === 'driving_license' ? application.drivingLicenseDoc : application.vehicleRcDoc;
     if (!doc) return false;
@@ -185,20 +223,60 @@ export function ScannerView({
     });
 
     try {
-      const res = await fetch('/api/extract-document', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          documentSlot: slot,
-          mimeType: doc.mimeType,
-          base64Data: doc.dataUrl,
-          consentGiven: true,
-        }),
-      });
+      const prepared = await optimizeImageForOcr(doc.dataUrl, doc.mimeType);
+      let payload: ExtractionApiResponse | null = null;
+      let lastFetchError = 'Document OCR extraction failed.';
 
-      const payload: ExtractionApiResponse = await res.json();
-      if (!res.ok || !payload.ok) {
-        throw new Error(payload.error || 'Document OCR extraction failed.');
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const res = await fetch('/api/extract-document', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            documentSlot: slot,
+            mimeType: prepared.mimeType,
+            base64Data: prepared.dataUrl,
+            consentGiven: true,
+          }),
+        });
+
+        const rawText = await res.text();
+        let parsed: ExtractionApiResponse | null = null;
+        try {
+          parsed = JSON.parse(rawText) as ExtractionApiResponse;
+        } catch {
+          parsed = null;
+        }
+
+        if (res.ok && parsed && parsed.ok) {
+          payload = parsed;
+          break;
+        }
+
+        if (parsed && parsed.error) {
+          lastFetchError = parsed.error;
+        } else if (res.status === 502 || res.status === 503 || res.status === 504) {
+          lastFetchError =
+            'The OCR service timed out or was temporarily busy. Please click "Scan Now" to retry.';
+        } else if (res.status === 413) {
+          lastFetchError = 'The document file is too large. Please crop or upload a smaller image.';
+        } else if (res.status === 404) {
+          lastFetchError =
+            'The OCR backend route is restarting or unavailable. Please wait a moment and retry.';
+        } else {
+          lastFetchError = `Unexpected server response (HTTP ${res.status}). Please retry scanning.`;
+        }
+
+        const shouldRetry =
+          attempt === 0 && (res.status >= 500 || res.status === 404 || parsed === null);
+        if (shouldRetry) {
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
+        break;
+      }
+
+      if (!payload || !payload.ok) {
+        throw new Error(lastFetchError);
       }
 
       const { detectedDocumentType, documentTypeReason, warnings, fields } = payload.extraction;
@@ -401,10 +479,12 @@ export function ScannerView({
     }
     setScanningAll(true);
     setGlobalError(null);
-    const tasks: Promise<boolean>[] = [];
-    if (application.drivingLicenseDoc) tasks.push(runExtractionForSlot('driving_license'));
-    if (application.vehicleRcDoc) tasks.push(runExtractionForSlot('vehicle_rc'));
-    await Promise.all(tasks);
+    if (application.drivingLicenseDoc) {
+      await runExtractionForSlot('driving_license');
+    }
+    if (application.vehicleRcDoc) {
+      await runExtractionForSlot('vehicle_rc');
+    }
     setScanningAll(false);
   };
 

@@ -1,10 +1,10 @@
 import 'dotenv/config';
 import express from 'express';
-import type { Request, Response } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import JSZip from 'jszip';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -608,7 +608,7 @@ async function createServer() {
             '1. First identify whether this document is actually a driving_license, a vehicle_rc (Vehicle Registration Certificate / Bill Book), or other.',
             '2. Extract ONLY text that is visibly printed on the document. NEVER guess, invent, infer, or hallucinate personal details.',
             '3. If a field (such as email, phoneNumber, localAddress, or identityCardNumber) is not printed on the document, set value to "" and confidence to "missing".',
-            '4. Format birthDate as DD/MM/YYYY if a date of birth is visibly present.',
+            '4. Format birthDate strictly as DD/MM/YYYY if a date of birth is visibly present (convert DD-MM-YYYY to DD/MM/YYYY).',
             '5. For nationality, use ISO 2-letter code like "IN" (India) or "NP" (Nepal) only when unambiguously indicated by the issuing country (e.g., Indian Union Driving Licence -> "IN", Government of Nepal -> "NP").',
             '6. Split full name into firstName (including middle name if any) and lastName accurately.',
             '7. Add a helpful warning in warnings[] if the photo is blurry, cropped, glare-obscured, or appears to be the wrong document type.',
@@ -618,20 +618,29 @@ async function createServer() {
             'Analyze the uploaded document image/PDF which the user placed in the Vehicle Bill Book / RC (Front Page) slot.',
             '1. First identify whether this document is actually a vehicle_rc (Vehicle Registration Certificate / Bill Book), a driving_license, or other.',
             '2. Extract ONLY text that is visibly printed on the document. NEVER guess, invent, infer, or hallucinate vehicle or owner details.',
-            '3. If a field (such as numberOfPassengers, vehicleColor, or ownerAddress) is not printed on the document, set value to "" and confidence to "missing".',
-            '4. For vehicleCountry, use ISO 2-letter code like "IN" (India) or "NP" (Nepal) only when unambiguously indicated by the issuing authority.',
-            '5. For vehicleType, extract the exact printed class (e.g., Motorcycle or Scooter, M-Cycle/Scooter, LMV, Motor Car, Jeep, Bus, Truck).',
-            '6. For chassisNumber and engineNumber, transcribe every character carefully and mark confidence "medium" or "low" if any digit/letter could be ambiguous (e.g., 0 vs O, 1 vs I, 5 vs S).',
-            '7. Add a helpful warning in warnings[] if the photo is blurry, cropped, glare-obscured, or appears to be the wrong document type.',
+            '3. If a field (such as numberOfPassengers, vehicleColor, vehicleBrand, or vehicleType) is not printed on the document, set value to "" and confidence to "missing".',
+            '4. For vehicleCountry, use ISO 2-letter code like "IN" (India) or "NP" (Nepal) only when unambiguously indicated by the issuing authority (e.g., Indian Union Vehicle Registration Certificate -> "IN").',
+            '5. For vehicleNumber, extract "Regn No" / "Registration Number" cleanly without stray spaces.',
+            '6. For chassisNumber ("Chasis No" or "Chassis No") and engineNumber ("Engine No" or "Engine / Motor Number"), transcribe every character carefully and mark confidence "medium" or "low" if any digit/letter could be ambiguous.',
+            '7. Put extra visible fields like Fuel, Emission Norms, Date of Regn, and Regn Validity into otherDetails.',
+            '8. Add a helpful warning in warnings[] if the photo is blurry, cropped, glare-obscured, or appears to be the wrong document type.',
           ].join('\n');
+
+      const modelAttempts = [
+        { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW },
+        { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL },
+        { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL },
+      ];
 
       let lastErr: unknown = null;
       let responseText: string | undefined;
+      let usedModel = '';
 
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let i = 0; i < modelAttempts.length; i++) {
+        const attemptCfg = modelAttempts[i];
         try {
           const response = await ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
+            model: attemptCfg.model,
             contents: {
               parts: [
                 {
@@ -646,22 +655,45 @@ async function createServer() {
             config: {
               responseMimeType: 'application/json',
               responseSchema: isLicense ? DRIVING_LICENSE_SCHEMA : VEHICLE_RC_SCHEMA,
+              thinkingConfig: { thinkingLevel: attemptCfg.thinkingLevel },
             },
           });
-          responseText = response.text;
-          break;
+          if (response.text && response.text.trim()) {
+            responseText = response.text;
+            usedModel = attemptCfg.model;
+            break;
+          }
+          lastErr = new Error('OCR model returned an empty response.');
         } catch (err) {
           lastErr = err;
-          if (attempt === 0) {
-            await new Promise((r) => setTimeout(r, 800));
+          if (i < modelAttempts.length - 1) {
+            await new Promise((r) => setTimeout(r, 450));
           }
         }
       }
 
       if (!responseText) {
-        const message =
-          lastErr instanceof Error ? lastErr.message : 'Document extraction failed. Please try a clearer image.';
-        res.status(502).json({ error: message });
+        let friendlyMessage = 'Document extraction failed. Please retry in a moment.';
+        if (lastErr instanceof Error) {
+          const raw = lastErr.message;
+          if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
+            friendlyMessage =
+              'The AI OCR service is temporarily busy. Please click "Scan Now" to retry in a few seconds.';
+          } else if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
+            friendlyMessage =
+              'OCR quota limit reached temporarily. Please wait a few seconds and retry, or check your API key in Settings > Secrets.';
+          } else if (
+            raw.includes('403') ||
+            raw.includes('API_KEY_INVALID') ||
+            raw.includes('PERMISSION_DENIED')
+          ) {
+            friendlyMessage =
+              'API key authentication failed. Please check your Gemini API key in Settings > Secrets.';
+          } else {
+            friendlyMessage = raw;
+          }
+        }
+        res.status(502).json({ error: friendlyMessage });
         return;
       }
 
@@ -669,6 +701,7 @@ async function createServer() {
       res.json({
         ok: true,
         documentSlot,
+        model: usedModel,
         extraction: parsed,
       });
     } catch (err) {
@@ -698,6 +731,20 @@ async function createServer() {
       const message = err instanceof Error ? err.message : 'Failed to build Chrome Extension bundle.';
       res.status(500).json({ error: message });
     }
+  });
+
+  // Ensure unknown /api/* routes and body-parser errors always return JSON
+  app.all('/api/*', (_req: Request, res: Response) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
+  app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+    if (req.path.startsWith('/api/')) {
+      const msg = err instanceof Error ? err.message : 'Invalid API request payload.';
+      res.status(400).json({ error: msg });
+      return;
+    }
+    next(err);
   });
 
   const isProd = process.env.NODE_ENV === 'production';
