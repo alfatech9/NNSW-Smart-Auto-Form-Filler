@@ -1,0 +1,6 @@
+{
+  "name": "NNSW Smart Auto Form Filler",
+  "description": "Smart Vehicle Registration Assistant that scans Driving Licenses and Vehicle Bill Book / RC documents to extract, verify, and prepare data for the official Nepal National Single Window Temporary Import of Vehicle (TIV) portal.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
